@@ -314,30 +314,125 @@ static int findInterfaces(char* ifNames, union socketAddress *ifAddrs, int ifNam
   return nIfs;
 }
 
+static ncclResult_t getPortRange(unsigned short *portMin, unsigned short *portMax, bool *portRangeValid) {
+  char *portRange = getenv("NCCL_PORT_RANGE");
+
+  if (portRange == NULL) {
+    *portRangeValid = false;
+    return ncclSuccess;
+  }
+
+  int ret = sscanf(portRange, "%hu:%hu", portMin, portMax);
+  if (ret != 2 || *portMax < *portMin) {
+    WARN("Net : invalid NCCL_PORT_RANGE : %s", portRange);
+    return ncclInvalidArgument;
+  }
+
+  INFO(NCCL_ALL, "Net : Socket port range : %hu:%hu", *portMin, *portMax);
+
+  *portRangeValid = true;
+  return ncclSuccess;
+}
+
+static ncclResult_t setSocketReuse(int sockfd, bool reuseport) {
+  int opt = 1;
+
+  int optname = SO_REUSEADDR;
+
+#if defined(SO_REUSEPORT)
+  if (reuseport){
+    optname |= SO_REUSEPORT;
+  }
+#endif
+
+  SYSCHECK(setsockopt(sockfd, SOL_SOCKET, optname, &opt, sizeof(opt)), "setsockopt");
+
+  return ncclSuccess;
+}
+
+/* A simple wrapper around bind(2) which also sets the port */
+static int bindToPort(int sockfd, const union socketAddress *addr, unsigned short port) {
+  /* Create a copy of the addr with the port set */
+  union socketAddress portAddr;
+  int salen;
+  memcpy(&portAddr, addr, sizeof(portAddr));
+  if (addr->sa.sa_family == AF_INET) {
+    salen = sizeof(sockaddr_in);
+    portAddr.sin.sin_port = htons(port);
+  } else {
+    salen = sizeof(sockaddr_in6);
+    portAddr.sin6.sin6_port = htons(port);
+  }
+
+  return bind(sockfd, &portAddr.sa, salen);
+}
+
 static ncclResult_t createListenSocket(int *fd, union socketAddress *localAddr) {
   /* IPv4/IPv6 support */
   int family = localAddr->sa.sa_family;
   int salen = (family == AF_INET) ? sizeof(sockaddr_in) : sizeof(sockaddr_in6);
 
-  /* Create socket and bind it to a port */
-  int sockfd = socket(family, SOCK_STREAM, 0);
-  if (sockfd == -1) {
-    WARN("Net : Socket creation failed : %s", strerror(errno));
-    return ncclSystemError;
-  }
+  int sockfd = -1;
+
+  unsigned short portMin;
+  unsigned short portMax;
+  bool portRangeValid = false;
+  NCCLCHECK(getPortRange(&portMin, &portMax, &portRangeValid));
 
   if (socketToPort(&localAddr->sa)) {
-    // Port is forced by env. Make sure we get the port.
-    int opt = 1;
-#if defined(SO_REUSEPORT)
-    SYSCHECK(setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt)), "setsockopt");
-#else
-    SYSCHECK(setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)), "setsockopt");
-#endif
+    /* A specific port was set in the environment, enable SO_REUSEPORT */
+    SYSCHECKVAL(socket(family, SOCK_STREAM, 0), "socket", sockfd);
+    NCCLCHECK(setSocketReuse(sockfd, true));
+    SYSCHECK(bind(sockfd, &localAddr->sa, salen), "bind");
+  } else if (!portRangeValid) {
+    /* No port or port range was specified, bind to any port */
+    SYSCHECKVAL(socket(family, SOCK_STREAM, 0), "socket", sockfd);
+    SYSCHECK(bind(sockfd, &localAddr->sa, salen), "bind");
+  } else {
+    /* Try to find something in the port range */
+    bool portFound = false;
+
+    for (size_t i = portMin; i <= (size_t)portMax; i++) {
+      union socketAddress tryAddr;
+      memcpy(&tryAddr, localAddr, sizeof(tryAddr));
+      if (family == AF_INET) {
+        tryAddr.sin.sin_port = htons((unsigned int)i);
+      } else {
+        tryAddr.sin6.sin6_port = htons((unsigned int)i);
+      }
+
+      SYSCHECKVAL(socket(family, SOCK_STREAM, 0), "socket", sockfd);
+
+      /* Set SO_REUSEADDR so ports are freed quickly, but not SO_REUSEPORT
+       * because we might bind multiple sockets to the same port
+       */
+      NCCLCHECK(setSocketReuse(sockfd, false));
+
+      int ret = bindToPort(sockfd, localAddr, (unsigned int)i);
+      /* Tolerate EADDRINUSE */
+      if (ret == -1 && errno == EADDRINUSE) {
+        /* Close the socket and try again */
+        close(sockfd);
+        continue;
+      }
+      /* In all other cases, propagate errors normally */
+      SYSCHECK(ret, "bind");
+
+      portFound = true;
+      break;
+    }
+
+    /* Make sure we found a port */
+    if (!portFound) {
+      WARN("Net : failed to bind in port range : %hu:%hu", portMin, portMax);
+      return ncclSystemError;
+    }
   }
 
-  // localAddr port should be 0 (Any port)
-  SYSCHECK(bind(sockfd, &localAddr->sa, salen), "bind");
+  /* Put the socket in listen mode
+   * NB: The backlog will be silently truncated to the value in /proc/sys/net/core/somaxconn
+   */
+  SYSCHECK(listen(sockfd, 16384), "listen");
 
   /* Get the assigned Port */
   socklen_t size = salen;
@@ -348,10 +443,6 @@ static ncclResult_t createListenSocket(int *fd, union socketAddress *localAddr) 
   TRACE(NCCL_INIT|NCCL_NET,"Listening on socket %s", socketToString(&localAddr->sa, line));
 #endif
 
-  /* Put the socket in listen mode
-   * NB: The backlog will be silently truncated to the value in /proc/sys/net/core/somaxconn
-   */
-  SYSCHECK(listen(sockfd, 16384), "listen");
   *fd = sockfd;
   return ncclSuccess;
 }
