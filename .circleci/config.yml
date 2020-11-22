@@ -1,0 +1,36 @@
+version: 2.1
+
+orbs:
+  aws-cli: circleci/aws-cli@1.3.1
+
+jobs:
+  build-and-upload-nccl:
+    parameters:
+      cuda-version:
+        type: string
+    docker:
+      - image: nvidia/cuda:<<parameters.cuda-version>>-cudnn7-devel-ubuntu18.04
+    resource_class: large
+    steps:
+      - run: |
+            apt-get update
+            apt-get install -y curl ca-certificates git unzip
+      - checkout
+      - aws-cli/setup
+      - run: |
+            date > test
+            aws s3 cp test s3://dzhu-dai-scratch-public/test
+            make -j4
+            output=nccl-g$(git rev-parse HEAD)-cuda-<<parameters.cuda-version>>.tar.gz
+            tar czf "$output" --transform='s/^build/nccl/' build
+            tar tvf "$output"
+            aws s3 cp "$output" s3://dzhu-dai-scratch-public/"$output"
+
+workflows:
+  publish:
+    jobs:
+      - build-and-upload-nccl:
+          context: aws
+          matrix:
+            parameters:
+              cuda-version: ["10.0"]
